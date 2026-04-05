@@ -2,7 +2,7 @@ FROM oven/bun:1 AS base
 WORKDIR /app
 
 # Copy monorepo root manifests
-COPY package.json package-lock.json ./
+COPY package.json ./
 
 # Copy package manifests for all workspaces
 COPY packages/config/package.json   ./packages/config/
@@ -11,8 +11,8 @@ COPY packages/env/package.json       ./packages/env/
 COPY packages/ui/package.json        ./packages/ui/
 COPY apps/server/package.json        ./apps/server/
 
-# Install all dependencies
-RUN npm install --frozen-lockfile
+# Install all dependencies (bun supports npm workspaces natively)
+RUN bun install
 
 # Copy source
 COPY packages/ ./packages/
