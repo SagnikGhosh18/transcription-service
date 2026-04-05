@@ -1,22 +1,11 @@
 FROM oven/bun:1 AS base
 WORKDIR /app
 
-# Copy monorepo root manifests
-COPY package.json ./
+# Copy entire monorepo so workspace symlinks resolve correctly
+COPY . .
 
-# Copy package manifests for all workspaces
-COPY packages/config/package.json   ./packages/config/
-COPY packages/db/package.json        ./packages/db/
-COPY packages/env/package.json       ./packages/env/
-COPY packages/ui/package.json        ./packages/ui/
-COPY apps/server/package.json        ./apps/server/
-
-# Install all dependencies (bun supports npm workspaces natively)
+# Install all dependencies
 RUN bun install
-
-# Copy source
-COPY packages/ ./packages/
-COPY apps/server/ ./apps/server/
 
 WORKDIR /app/apps/server
 
