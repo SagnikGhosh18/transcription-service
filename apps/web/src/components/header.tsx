@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { LogOut, User } from "lucide-react";
 
-import { Button } from "@my-better-t-app/ui/components/button";
+import { Button, buttonVariants } from "@my-better-t-app/ui/components/button";
 import { useAuth } from "@/context/auth";
 import { ModeToggle } from "./mode-toggle";
 
@@ -44,9 +44,9 @@ export default function Header() {
               </Button>
             </div>
           ) : (
-            <Button variant="ghost" size="sm" asChild>
-              <Link href="/login">Sign in</Link>
-            </Button>
+            <Link href="/login" className={buttonVariants({ variant: "ghost", size: "sm" })}>
+              Sign in
+            </Link>
           )}
         </div>
       </div>
