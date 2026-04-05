@@ -73,3 +73,48 @@ npm run dev
 npm run db:stop    # Stop PostgreSQL
 npm run db:down    # Stop and remove container + volume
 ```
+
+---
+
+## Deployment
+
+The recommended stack is **Vercel** (frontend) + **Railway** (backend + PostgreSQL). No separate object store is needed — audio is stored directly in PostgreSQL.
+
+### Backend — Railway
+
+1. Create a new project at [railway.app](https://railway.app)
+2. Add a **PostgreSQL** service (Railway addon) — it auto-injects `DATABASE_URL`
+3. Add a second service from your GitHub repo, set the **Root Directory** to `apps/server`
+4. Railway will detect the `Dockerfile` automatically — no start command needed
+5. Add environment variables in the Railway dashboard:
+
+   | Variable | Value |
+   |----------|-------|
+   | `DATABASE_URL` | Auto-injected by Railway PostgreSQL addon |
+   | `CORS_ORIGIN` | Your Vercel frontend URL (e.g. `https://your-app.vercel.app`) |
+   | `GEMINI_API_KEY` | Your Google AI Studio key |
+   | `JWT_SECRET` | Run `openssl rand -hex 32` and paste the result |
+   | `NODE_ENV` | `production` |
+
+6. After the first deploy, run the schema push once via Railway's shell or a one-off command:
+   ```
+   npx drizzle-kit push
+   ```
+
+### Frontend — Vercel
+
+1. Import your GitHub repo at [vercel.com/new](https://vercel.com/new)
+2. Set the **Root Directory** to `apps/web`
+3. Framework preset: **Next.js** (auto-detected)
+4. Add environment variables:
+
+   | Variable | Value |
+   |----------|-------|
+   | `NEXT_PUBLIC_SERVER_URL` | Your Railway backend URL (e.g. `https://your-server.up.railway.app`) |
+
+5. Deploy — Vercel handles the build automatically.
+
+### After deployment
+
+- Visit your Vercel URL, register an account, and start recording.
+- The backend URL and CORS origin must match exactly (no trailing slash).
