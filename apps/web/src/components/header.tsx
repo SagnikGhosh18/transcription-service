@@ -1,28 +1,53 @@
 "use client";
-import Link from "next/link";
 
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { LogOut, User } from "lucide-react";
+
+import { Button } from "@my-better-t-app/ui/components/button";
+import { useAuth } from "@/context/auth";
 import { ModeToggle } from "./mode-toggle";
 
 export default function Header() {
-  const links = [
-    { to: "/", label: "Home" },
-    { to: "/recorder", label: "Recorder" },
-  ] as const;
+  const { isAuthenticated, username, logout } = useAuth();
+  const router = useRouter();
+
+  const handleLogout = () => {
+    logout();
+    router.push("/login");
+  };
 
   return (
     <div>
       <div className="flex flex-row items-center justify-between px-2 py-1">
         <nav className="flex gap-4 text-lg">
-          {links.map(({ to, label }) => {
-            return (
-              <Link key={to} href={to}>
-                {label}
-              </Link>
-            );
-          })}
+          <Link href="/">Home</Link>
+          {isAuthenticated && (
+            <>
+              <Link href="/recorder">Recorder</Link>
+              <Link href="/history">History</Link>
+            </>
+          )}
         </nav>
+
         <div className="flex items-center gap-2">
           <ModeToggle />
+          {isAuthenticated ? (
+            <div className="flex items-center gap-2">
+              <span className="flex items-center gap-1 text-sm text-muted-foreground">
+                <User className="size-3.5" />
+                {username}
+              </span>
+              <Button variant="ghost" size="sm" className="gap-1.5" onClick={handleLogout}>
+                <LogOut className="size-3.5" />
+                Sign out
+              </Button>
+            </div>
+          ) : (
+            <Button variant="ghost" size="sm" asChild>
+              <Link href="/login">Sign in</Link>
+            </Button>
+          )}
         </div>
       </div>
       <hr />

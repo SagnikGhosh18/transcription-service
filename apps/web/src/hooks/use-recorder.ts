@@ -9,6 +9,9 @@ export interface WavChunk {
   url: string
   duration: number
   timestamp: number
+  sequenceNumber: number
+  uploadStatus: "pending" | "uploading" | "uploaded" | "failed"
+  serverId?: string  // chunk ID assigned by the server on ack
 }
 
 export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
@@ -16,7 +19,11 @@ export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
 interface UseRecorderOptions {
   chunkDuration?: number
   deviceId?: string
+  serverUrl?: string
+  authToken?: string | null
 }
+
+// ─── WAV encoding ─────────────────────────────────────────────────────────────
 
 function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   const buffer = new ArrayBuffer(44 + samples.length * 2)
@@ -65,13 +72,88 @@ function resample(input: Float32Array, fromRate: number, toRate: number): Float3
   return output
 }
 
+// ─── OPFS helpers ─────────────────────────────────────────────────────────────
+// Each chunk is written to OPFS before any network call, guaranteeing
+// the audio is recoverable even if the upload fails or the tab closes.
+
+async function saveToOpfs(sessionId: string, seqNum: number, blob: Blob): Promise<void> {
+  try {
+    const root = await navigator.storage.getDirectory()
+    const sessionDir = await root.getDirectoryHandle(sessionId, { create: true })
+    const fileHandle = await sessionDir.getFileHandle(`chunk-${seqNum}.wav`, { create: true })
+    const writable = await fileHandle.createWritable()
+    await writable.write(blob)
+    await writable.close()
+  } catch (err) {
+    console.warn("[OPFS] save failed:", err)
+  }
+}
+
+async function readFromOpfs(sessionId: string, seqNum: number): Promise<Blob | null> {
+  try {
+    const root = await navigator.storage.getDirectory()
+    const sessionDir = await root.getDirectoryHandle(sessionId)
+    const fileHandle = await sessionDir.getFileHandle(`chunk-${seqNum}.wav`)
+    return await fileHandle.getFile()
+  } catch {
+    return null
+  }
+}
+
+async function deleteFromOpfs(sessionId: string, seqNum: number): Promise<void> {
+  try {
+    const root = await navigator.storage.getDirectory()
+    const sessionDir = await root.getDirectoryHandle(sessionId)
+    await sessionDir.removeEntry(`chunk-${seqNum}.wav`)
+  } catch {
+    // Ignore — file may already be gone
+  }
+}
+
+// ─── Upload helper ────────────────────────────────────────────────────────────
+
+async function uploadChunkToServer(
+  serverUrl: string,
+  recordingId: string,
+  seqNum: number,
+  durationMs: number,
+  blob: Blob,
+  authToken?: string | null,
+): Promise<{ chunkId: string }> {
+  const form = new FormData()
+  form.append("recordingId", recordingId)
+  form.append("sequenceNumber", String(seqNum))
+  form.append("durationMs", String(durationMs))
+  form.append("file", blob, `chunk-${seqNum}.wav`)
+
+  const headers: Record<string, string> = {}
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`
+
+  const res = await fetch(`${serverUrl}/api/chunks/upload`, {
+    method: "POST",
+    headers,
+    body: form,
+  })
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "")
+    throw new Error(`Upload ${seqNum} failed (${res.status}): ${text}`)
+  }
+
+  return res.json() as Promise<{ chunkId: string }>
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
 export function useRecorder(options: UseRecorderOptions = {}) {
-  const { chunkDuration = 5, deviceId } = options
+  const { chunkDuration = 5, deviceId, serverUrl, authToken } = options
 
   const [status, setStatus] = useState<RecorderStatus>("idle")
   const [chunks, setChunks] = useState<WavChunk[]>([])
   const [elapsed, setElapsed] = useState(0)
   const [stream, setStream] = useState<MediaStream | null>(null)
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [recordingId, setRecordingId] = useState<string | null>(null)
 
   const streamRef = useRef<MediaStream | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
@@ -83,9 +165,58 @@ export function useRecorder(options: UseRecorderOptions = {}) {
   const startTimeRef = useRef(0)
   const pausedElapsedRef = useRef(0)
   const statusRef = useRef<RecorderStatus>("idle")
+  const seqRef = useRef(0)
+  const sessionIdRef = useRef<string | null>(null)
+  const recordingIdRef = useRef<string | null>(null)
 
   statusRef.current = status
 
+  // ── Persist + upload a finalized WAV blob ──────────────────────────────────
+  const persistAndUpload = useCallback(
+    async (blob: Blob, seqNum: number, durationMs: number) => {
+      const sid = sessionIdRef.current
+      const rid = recordingIdRef.current
+
+      // 1. Always save to OPFS first — guarantees recovery on failure
+      if (sid) await saveToOpfs(sid, seqNum, blob)
+
+      // 2. Update upload status to uploading
+      setChunks((prev) =>
+        prev.map((c) =>
+          c.sequenceNumber === seqNum ? { ...c, uploadStatus: "uploading" } : c,
+        ),
+      )
+
+      // 3. Upload to server (if server URL + recording ID are known)
+      if (!serverUrl || !rid) return
+
+      try {
+        const { chunkId } = await uploadChunkToServer(serverUrl, rid, seqNum, durationMs, blob, authToken)
+
+        // 4. Ack received — safe to remove from OPFS
+        if (sid) await deleteFromOpfs(sid, seqNum)
+
+        setChunks((prev) =>
+          prev.map((c) =>
+            c.sequenceNumber === seqNum
+              ? { ...c, uploadStatus: "uploaded", serverId: chunkId }
+              : c,
+          ),
+        )
+      } catch (err) {
+        console.error("[upload] chunk", seqNum, "failed:", err)
+        // Keep in OPFS — user can reconcile later
+        setChunks((prev) =>
+          prev.map((c) =>
+            c.sequenceNumber === seqNum ? { ...c, uploadStatus: "failed" } : c,
+          ),
+        )
+      }
+    },
+    [serverUrl],
+  )
+
+  // ── Flush current sample buffer as a chunk ─────────────────────────────────
   const flushChunk = useCallback(() => {
     if (samplesRef.current.length === 0) return
 
@@ -101,21 +232,51 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
     const blob = encodeWav(merged, SAMPLE_RATE)
     const url = URL.createObjectURL(blob)
+    const seqNum = seqRef.current++
+    const durationMs = Math.round((merged.length / SAMPLE_RATE) * 1000)
+
     const chunk: WavChunk = {
       id: crypto.randomUUID(),
       blob,
       url,
       duration: merged.length / SAMPLE_RATE,
       timestamp: Date.now(),
+      sequenceNumber: seqNum,
+      uploadStatus: "pending",
     }
-    setChunks((prev) => [...prev, chunk])
-  }, [])
 
+    setChunks((prev) => [...prev, chunk])
+    persistAndUpload(blob, seqNum, durationMs)
+  }, [persistAndUpload])
+
+  // ── Start recording ────────────────────────────────────────────────────────
   const start = useCallback(async () => {
     if (statusRef.current === "recording") return
 
     setStatus("requesting")
     try {
+      // Generate a new session ID and create recording on server
+      const sid = crypto.randomUUID()
+      sessionIdRef.current = sid
+      setSessionId(sid)
+      seqRef.current = 0
+
+      if (serverUrl) {
+        const res = await fetch(`${serverUrl}/api/recordings`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          },
+          body: JSON.stringify({ sessionId: sid }),
+        })
+        if (res.ok) {
+          const { id } = (await res.json()) as { id: string }
+          recordingIdRef.current = id
+          setRecordingId(id)
+        }
+      }
+
       const mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: deviceId
           ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
@@ -137,7 +298,6 @@ export function useRecorder(options: UseRecorderOptions = {}) {
         sampleCountRef.current += resampled.length
 
         if (sampleCountRef.current >= chunkThreshold) {
-          // flush synchronously from the collected buffers
           const totalLen = samplesRef.current.reduce((n, b) => n + b.length, 0)
           const merged = new Float32Array(totalLen)
           let off = 0
@@ -150,14 +310,21 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
           const blob = encodeWav(merged, SAMPLE_RATE)
           const url = URL.createObjectURL(blob)
+          const seqNum = seqRef.current++
+          const durationMs = Math.round((merged.length / SAMPLE_RATE) * 1000)
+
           const chunk: WavChunk = {
             id: crypto.randomUUID(),
             blob,
             url,
             duration: merged.length / SAMPLE_RATE,
             timestamp: Date.now(),
+            sequenceNumber: seqNum,
+            uploadStatus: "pending",
           }
+
           setChunks((prev) => [...prev, chunk])
+          persistAndUpload(blob, seqNum, durationMs)
         }
       }
 
@@ -179,16 +346,17 @@ export function useRecorder(options: UseRecorderOptions = {}) {
       timerRef.current = setInterval(() => {
         if (statusRef.current === "recording") {
           setElapsed(
-            pausedElapsedRef.current + (Date.now() - startTimeRef.current) / 1000
+            pausedElapsedRef.current + (Date.now() - startTimeRef.current) / 1000,
           )
         }
       }, 100)
     } catch {
       setStatus("idle")
     }
-  }, [deviceId, chunkThreshold])
+  }, [deviceId, chunkThreshold, serverUrl, persistAndUpload])
 
-  const stop = useCallback(() => {
+  // ── Stop recording ─────────────────────────────────────────────────────────
+  const stop = useCallback(async () => {
     flushChunk()
 
     processorRef.current?.disconnect()
@@ -203,7 +371,18 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     streamRef.current = null
     setStream(null)
     setStatus("idle")
-  }, [flushChunk])
+
+    // Mark recording as complete on the server to trigger transcription
+    const rid = recordingIdRef.current
+    if (serverUrl && rid) {
+      fetch(`${serverUrl}/api/recordings/${rid}/complete`, {
+        method: "POST",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      }).catch(
+        (err) => console.error("[recordings] complete failed:", err),
+      )
+    }
+  }, [flushChunk, serverUrl])
 
   const pause = useCallback(() => {
     if (statusRef.current !== "recording") return
@@ -222,7 +401,26 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     setChunks([])
   }, [chunks])
 
-  // cleanup on unmount
+  // Retry a specific failed chunk from OPFS
+  const retryChunk = useCallback(
+    async (seqNum: number) => {
+      const sid = sessionIdRef.current
+      const rid = recordingIdRef.current
+      if (!sid || !rid || !serverUrl) return
+
+      const blob = await readFromOpfs(sid, seqNum)
+      if (!blob) return
+
+      const chunk = chunks.find((c) => c.sequenceNumber === seqNum)
+      if (!chunk) return
+
+      const durationMs = Math.round(chunk.duration * 1000)
+      await persistAndUpload(blob, seqNum, durationMs)
+    },
+    [chunks, serverUrl, persistAndUpload],
+  )
+
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       processorRef.current?.disconnect()
@@ -234,5 +432,18 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     }
   }, [])
 
-  return { status, start, stop, pause, resume, chunks, elapsed, stream, clearChunks }
+  return {
+    status,
+    start,
+    stop,
+    pause,
+    resume,
+    chunks,
+    elapsed,
+    stream,
+    clearChunks,
+    retryChunk,
+    sessionId,
+    recordingId,
+  }
 }
