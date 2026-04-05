@@ -24,4 +24,7 @@ app.route("/api/auth", authRoute);
 app.route("/api/recordings", recordingsRoute);
 app.route("/api/chunks", chunksRoute);
 
-export default app;
+export default {
+  port: 8080,
+  fetch: app.fetch,
+};
